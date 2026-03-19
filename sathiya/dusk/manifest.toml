@@ -1,6 +1,6 @@
 [meta]
 name = "dusk"
-author = "_test"
+author = "_test" 
 version = "0.2.0"
 wm = "bspwm"
 display_server = ["x11"]

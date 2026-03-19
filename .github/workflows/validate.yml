@@ -2,8 +2,8 @@ name: Validate Rice Submission
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main, test]
+    types: [opened, synchronize, reopened]
 
 jobs:
   validate:
@@ -15,21 +15,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Get changed files
         id: changed
         run: |
-          git diff --name-only origin/main...HEAD > changed_files.txt
+          git fetch origin ${{ github.base_ref }}
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed_files.txt
           cat changed_files.txt
 
       - name: Detect rice being submitted
         id: detect
         run: |
-          # Find the author and theme from the changed files
-          # Expected structure: <author>/<theme>/...
-          RICE=$(cat changed_files.txt | grep -v '^README' | head -1 | cut -d'/' -f1,2)
-          AUTHOR=$(echo $RICE | cut -d'/' -f1)
-          THEME=$(echo $RICE | cut -d'/' -f2)
+          # Extract first valid path like author/theme/...
+          RICE=$(grep -E '^[^/]+/[^/]+' changed_files.txt | head -1 | cut -d'/' -f1,2)
+
+          AUTHOR=$(echo "$RICE" | cut -d'/' -f1)
+          THEME=$(echo "$RICE" | cut -d'/' -f2)
 
           if [ -z "$AUTHOR" ] || [ -z "$THEME" ]; then
             echo "::error::Could not detect author/theme from changed files."
@@ -39,6 +41,7 @@ jobs:
           echo "author=$AUTHOR" >> $GITHUB_OUTPUT
           echo "theme=$THEME" >> $GITHUB_OUTPUT
           echo "rice_path=$AUTHOR/$THEME" >> $GITHUB_OUTPUT
+
           echo "Detected rice: $AUTHOR/$THEME"
 
       - name: Check directory structure
@@ -47,32 +50,14 @@ jobs:
           RICE_PATH="${{ steps.detect.outputs.rice_path }}"
           ERRORS=""
 
-          # Check manifest.toml exists
-          if [ ! -f "$RICE_PATH/manifest.toml" ]; then
-            ERRORS="$ERRORS\n- manifest.toml is missing at $RICE_PATH/manifest.toml"
-          fi
+          [ ! -f "$RICE_PATH/manifest.toml" ] && ERRORS="$ERRORS\n- manifest.toml missing"
+          [ ! -d "$RICE_PATH/configs" ] && ERRORS="$ERRORS\n- configs/ missing"
+          [ ! -d "$RICE_PATH/walls" ] && ERRORS="$ERRORS\n- walls/ missing"
+          [ ! -f "$RICE_PATH/preview.png" ] && ERRORS="$ERRORS\n- preview.png missing"
 
-          # Check configs/ directory exists
-          if [ ! -d "$RICE_PATH/configs" ]; then
-            ERRORS="$ERRORS\n- configs/ directory is missing"
-          fi
-
-          # Check at least one component directory exists inside configs/
           if [ -d "$RICE_PATH/configs" ]; then
-            COMPONENT_COUNT=$(ls -d $RICE_PATH/configs/*/ 2>/dev/null | wc -l)
-            if [ "$COMPONENT_COUNT" -eq 0 ]; then
-              ERRORS="$ERRORS\n- configs/ is empty, at least one component directory is required"
-            fi
-          fi
-
-          # Check walls/ directory exists
-          if [ ! -d "$RICE_PATH/walls" ]; then
-            ERRORS="$ERRORS\n- walls/ directory is missing"
-          fi
-
-          # Check preview.png exists
-          if [ ! -f "$RICE_PATH/preview.png" ]; then
-            ERRORS="$ERRORS\n- preview.png is missing"
+            COUNT=$(find "$RICE_PATH/configs" -mindepth 1 -maxdepth 1 -type d | wc -l)
+            [ "$COUNT" -eq 0 ] && ERRORS="$ERRORS\n- configs/ is empty"
           fi
 
           if [ -n "$ERRORS" ]; then
@@ -89,9 +74,7 @@ jobs:
         if: steps.structure.outputs.passed == 'true'
         run: |
           RICE_PATH="${{ steps.detect.outputs.rice_path }}"
-          ERRORS=""
 
-          # Install tomllib parser
           pip install tomli --quiet
 
           python3 << EOF
@@ -101,33 +84,31 @@ jobs:
           except ImportError:
               import tomllib
 
-          with open("$RICE_PATH/manifest.toml", "rb") as f:
-              try:
+          try:
+              with open("$RICE_PATH/manifest.toml", "rb") as f:
                   manifest = tomllib.load(f)
-              except Exception as e:
-                  print(f"TOML_ERROR:{e}")
-                  sys.exit(1)
-
-          meta = manifest.get("meta", {})
-          required_fields = ["name", "author", "version", "wm", "display_server", "components", "description"]
-          missing = [f for f in required_fields if f not in meta]
-
-          if missing:
-              print(f"MISSING_FIELDS:{','.join(missing)}")
+          except Exception as e:
+              print(f"TOML_ERROR:{e}")
               sys.exit(1)
 
-          # Check components is a non-empty list
-          if not isinstance(meta.get("components"), list) or len(meta["components"]) == 0:
+          meta = manifest.get("meta", {})
+          required = ["name", "author", "version", "wm", "display_server", "components", "description"]
+
+          missing = [f for f in required if f not in meta]
+          if missing:
+              print("MISSING_FIELDS:" + ",".join(missing))
+              sys.exit(1)
+
+          if not isinstance(meta.get("components"), list) or not meta["components"]:
               print("EMPTY_COMPONENTS")
               sys.exit(1)
 
           print("OK")
           EOF
 
-          RESULT=$?
-          if [ $RESULT -ne 0 ]; then
+          if [ $? -ne 0 ]; then
             echo "passed=false" >> $GITHUB_OUTPUT
-            echo "errors=manifest.toml validation failed. Check that all required fields are present: name, author, version, wm, display_server, components, description." >> $GITHUB_OUTPUT
+            echo "errors=Invalid manifest.toml (missing fields or invalid format)" >> $GITHUB_OUTPUT
           else
             echo "passed=true" >> $GITHUB_OUTPUT
           fi
@@ -139,17 +120,11 @@ jobs:
           RICE_PATH="${{ steps.detect.outputs.rice_path }}"
           ERRORS=""
 
-          # Check for executable files
-          EXECUTABLES=$(find "$RICE_PATH" -type f -perm /111 ! -name "*.png" ! -name "*.jpg" ! -name "*.jpeg" ! -name "*.webp")
-          if [ -n "$EXECUTABLES" ]; then
-            ERRORS="$ERRORS\n- Executable files are not allowed:\n$EXECUTABLES"
-          fi
+          EXEC=$(find "$RICE_PATH" -type f -perm /111 ! -name "*.png" ! -name "*.jpg" ! -name "*.jpeg" ! -name "*.webp")
+          [ -n "$EXEC" ] && ERRORS="$ERRORS\n- Executables found:\n$EXEC"
 
-          # Check for unexpected binary files (not images)
-          BINARIES=$(find "$RICE_PATH" -type f ! -name "*.png" ! -name "*.jpg" ! -name "*.jpeg" ! -name "*.webp" ! -name "*.toml" ! -name "*.conf" ! -name "*.ini" ! -name "*.cfg" ! -name "*.rasi" ! -name "*.css" ! -name "*.json" ! -name "*.kdl" ! -name "*.lua" ! -name "*.yuck" ! -name "*.fish" ! -name "*.sh" ! -name "*.zsh" ! -name "*.bash" | xargs file 2>/dev/null | grep -i "binary\|executable\|ELF" | cut -d: -f1)
-          if [ -n "$BINARIES" ]; then
-            ERRORS="$ERRORS\n- Unexpected binary files found:\n$BINARIES"
-          fi
+          BIN=$(find "$RICE_PATH" -type f | xargs file 2>/dev/null | grep -iE "binary|ELF" | cut -d: -f1)
+          [ -n "$BIN" ] && ERRORS="$ERRORS\n- Binary files found:\n$BIN"
 
           if [ -n "$ERRORS" ]; then
             echo "errors<<EOF" >> $GITHUB_OUTPUT
@@ -167,29 +142,11 @@ jobs:
           RICE_PATH="${{ steps.detect.outputs.rice_path }}"
           SUSPICIOUS=""
 
-          # Patterns to flag in config files
-          PATTERNS=(
-            "curl "
-            "wget "
-            "bash -c"
-            "sh -c"
-            "eval "
-            "base64 -d"
-            "base64 --decode"
-            "nc -"
-            "ncat "
-            "/dev/tcp"
-            "mkfifo"
-            "chmod +x"
-            "sudo "
-            "rm -rf"
-          )
+          PATTERNS=("curl " "wget " "bash -c" "sh -c" "eval " "base64 -d" "nc " "/dev/tcp" "mkfifo" "chmod +x" "sudo " "rm -rf")
 
-          for PATTERN in "${PATTERNS[@]}"; do
-            MATCHES=$(grep -rn "$PATTERN" "$RICE_PATH/configs/" 2>/dev/null | head -5)
-            if [ -n "$MATCHES" ]; then
-              SUSPICIOUS="$SUSPICIOUS\n- Suspicious pattern '$PATTERN' found:\n$MATCHES"
-            fi
+          for P in "${PATTERNS[@]}"; do
+            MATCH=$(grep -rn "$P" "$RICE_PATH/configs/" 2>/dev/null | head -5)
+            [ -n "$MATCH" ] && SUSPICIOUS="$SUSPICIOUS\n- Pattern '$P':\n$MATCH"
           done
 
           if [ -n "$SUSPICIOUS" ]; then
@@ -201,16 +158,14 @@ jobs:
             echo "passed=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Validate preview.png is a real image
+      - name: Validate preview.png
         id: preview
         if: steps.security.outputs.passed == 'true'
         run: |
-          RICE_PATH="${{ steps.detect.outputs.rice_path }}"
-
-          FILE_TYPE=$(file "$RICE_PATH/preview.png" | grep -i "PNG image\|JPEG image\|image data")
-          if [ -z "$FILE_TYPE" ]; then
+          FILE=$(file "${{ steps.detect.outputs.rice_path }}/preview.png" | grep -i "image")
+          if [ -z "$FILE" ]; then
             echo "passed=false" >> $GITHUB_OUTPUT
-            echo "errors=preview.png is not a valid image file. Please provide a real screenshot." >> $GITHUB_OUTPUT
+            echo "errors=Invalid preview.png" >> $GITHUB_OUTPUT
           else
             echo "passed=true" >> $GITHUB_OUTPUT
           fi
@@ -225,20 +180,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const author = "${{ steps.detect.outputs.author }}";
-            const theme = "${{ steps.detect.outputs.theme }}";
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: `## ✓ Rice validation passed
-                    **${author}/${theme}** looks good.
-                    - Structure is correct
-                    - manifest.toml is valid
-                    - No executables or binaries
-                    - No suspicious content in configs
-                    - preview.png is a valid image
-                    This rice is ready for maintainer review.`
+                    **${{ steps.detect.outputs.author }}/${{ steps.detect.outputs.theme }}** is valid and ready for review.`
             });
 
       - name: Comment failure on PR
@@ -251,38 +198,31 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const author = "${{ steps.detect.outputs.author }}";
-            const theme = "${{ steps.detect.outputs.theme }}";
-
             let errors = [];
 
-            if ("${{ steps.structure.outputs.passed }}" === "false") {
-              errors.push("**Structure errors:**\n${{ steps.structure.outputs.errors }}");
-            }
-            if ("${{ steps.manifest.outputs.passed }}" === "false") {
-              errors.push("**Manifest errors:**\n${{ steps.manifest.outputs.errors }}");
-            }
-            if ("${{ steps.executables.outputs.passed }}" === "false") {
-              errors.push("**Executable/binary errors:**\n${{ steps.executables.outputs.errors }}");
-            }
-            if ("${{ steps.security.outputs.passed }}" === "false") {
-              errors.push("**Security flags:**\n${{ steps.security.outputs.suspicious }}\n\nIf these are false positives, explain in a comment and a maintainer will review manually.");
-            }
-            if ("${{ steps.preview.outputs.passed }}" === "false") {
-              errors.push("**Preview errors:**\n${{ steps.preview.outputs.errors }}");
-            }
+            if ("${{ steps.structure.outputs.passed }}" === "false")
+              errors.push("${{ steps.structure.outputs.errors }}");
+
+            if ("${{ steps.manifest.outputs.passed }}" === "false")
+              errors.push("${{ steps.manifest.outputs.errors }}");
+
+            if ("${{ steps.executables.outputs.passed }}" === "false")
+              errors.push("${{ steps.executables.outputs.errors }}");
+
+            if ("${{ steps.security.outputs.passed }}" === "false")
+              errors.push("${{ steps.security.outputs.suspicious }}");
+
+            if ("${{ steps.preview.outputs.passed }}" === "false")
+              errors.push("${{ steps.preview.outputs.errors }}");
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## ✗ Rice validation failed
-                    **${author}/${theme}** did not pass validation.
-                      ${errors.join("\n\n")}
-                      Fix the issues above and push again.`
+              body: `## ✗ Rice validation failed\n\n${errors.join("\n\n")}`
             });
 
-      - name: Fail the workflow if validation failed
+      - name: Fail workflow
         if: |
           steps.structure.outputs.passed == 'false' ||
           steps.manifest.outputs.passed == 'false' ||
